@@ -1,0 +1,93 @@
+--- a/iwinfo_nl80211.c
++++ b/iwinfo_nl80211.c
+@@ -1252,6 +1252,7 @@ static int nl80211_get_ssid_bssid_cb(struct nl_msg *msg, void *arg)
+
+ 	static const struct nla_policy bss_policy[NL80211_BSS_MAX + 1] = {
+ 		[NL80211_BSS_INFORMATION_ELEMENTS] = { 0 },
++		[NL80211_BSS_MLD_ADDR]             = { 0 },
+ 		[NL80211_BSS_STATUS]               = { .type = NLA_U32 },
+ 	};
+
+@@ -1290,8 +1291,18 @@ static int nl80211_get_ssid_bssid_cb(struct nl_msg *msg, void *arg)
+ 		}
+ 		else
+ 		{
++			const void *addr = nla_data(bss[NL80211_BSS_BSSID]);
++
++			/* For MLO the station is addressed by its MLD address */
++			if (nla_get_u32(bss[NL80211_BSS_STATUS]) ==
++			        NL80211_BSS_STATUS_ASSOCIATED &&
++			    bss[NL80211_BSS_MLD_ADDR])
++			{
++				addr = nla_data(bss[NL80211_BSS_MLD_ADDR]);
++			}
++
+ 			sb->bssid[0] = 1;
+-			memcpy(sb->bssid + 1, nla_data(bss[NL80211_BSS_BSSID]), 6);
++			memcpy(sb->bssid + 1, addr, 6);
+ 			return NL_SKIP;
+ 		}
+
+@@ -1695,10 +1706,30 @@ static int nl80211_fill_signal_cb(struct nl_msg *msg, void *arg)
+ 	return NL_SKIP;
+ }
+
++static int nl80211_get_station_by_mac(const char *ifname, const uint8_t *mac,
++                                      int (*cb_func)(struct nl_msg *, void *),
++                                      void *cb_arg)
++{
++	struct nl80211_msg_conveyor *cv;
++
++	cv = nl80211_msg(ifname, NL80211_CMD_GET_STATION, 0);
++	if (!cv)
++		return -ENOMEM;
++
++	NLA_PUT(cv->msg, NL80211_ATTR_MAC, 6, mac);
++
++	return nl80211_send(cv, cb_func, cb_arg);
++
++nla_put_failure:
++	nl80211_free(cv);
++	return -ENOMEM;
++}
++
+ static void nl80211_fill_signal(const char *ifname, struct nl80211_rssi_rate *r)
+ {
+ 	DIR *d;
+ 	struct dirent *de;
++	int rssi_samples, rate_samples;
+
+ 	memset(r, 0, sizeof(*r));
+
+@@ -1710,8 +1741,32 @@ static void nl80211_fill_signal(const char *ifname, struct nl80211_rssi_rate *r)
+ 			    (!de->d_name[strlen(ifname)] ||
+ 			     !strncmp(&de->d_name[strlen(ifname)], ".sta", 4)))
+ 			{
++				rssi_samples = r->rssi_samples;
++				rate_samples = r->rate_samples;
++
+ 				nl80211_request(de->d_name, NL80211_CMD_GET_STATION,
+ 				                NLM_F_DUMP, nl80211_fill_signal_cb, r);
++
++				/*
++				 * Some drivers (e.g. brcmfmac) do not return any data
++				 * for a station dump on a client interface. Query the
++				 * associated BSSID directly, like "iw dev <if> link".
++				 */
++				if (r->rssi_samples == rssi_samples &&
++				    r->rate_samples == rate_samples)
++				{
++					struct nl80211_ssid_bssid sb = { };
++
++					if (!nl80211_request(de->d_name, NL80211_CMD_GET_SCAN,
++					                     NLM_F_DUMP,
++					                     nl80211_get_ssid_bssid_cb, &sb) &&
++					    sb.bssid[0])
++					{
++						nl80211_get_station_by_mac(de->d_name,
++						                           sb.bssid + 1,
++						                           nl80211_fill_signal_cb, r);
++					}
++				}
+ 			}
+ 		}
