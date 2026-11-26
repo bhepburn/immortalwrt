@@ -59,18 +59,56 @@ function phy_is_fullmac(phy)
 	return __phy_is_fullmac(phyidx);
 }
 
+// A fullmac driver may keep a default interface that is not configured yet,
+// and reusing it avoids creating another one. An interface that a
+// configuration already owns must not be reused: an AP that ap_start_disabled
+// leaves down would otherwise be renamed to the name of a station that is
+// created next.
+function wdev_configured_names()
+{
+	let names = {};
+
+	for (let file in glob("/var/run/hostapd-*.conf"))
+		for (let line in split(readfile(file) ?? "", "\n")) {
+			let m = match(line, /^(interface|bss)=(.+)$/);
+			if (m)
+				names[trim(m[2])] = true;
+		}
+
+	for (let file in glob("/var/run/wpa-supplicant-*.conf")) {
+		let m = match(file, /\/wpa-supplicant-(.+)\.conf$/);
+		if (m)
+			names[m[1]] = true;
+	}
+
+	for (let file in glob("/var/run/wdev-*.json")) {
+		let config = json(readfile(file) ?? "");
+		if (type(config) != "object")
+			continue;
+
+		for (let name in config)
+			names[name] = true;
+	}
+
+	return names;
+}
+
 function find_reusable_wdev(phyidx)
 {
 	if (!__phy_is_fullmac(phyidx))
 		return null;
 
+	let configured = wdev_configured_names();
 	let data = nl80211.request(
 		nl80211.const.NL80211_CMD_GET_INTERFACE,
 		nl80211.const.NLM_F_DUMP,
 		{ wiphy: phyidx });
-	for (let res in data)
+	for (let res in data) {
+		if (configured[res.ifname])
+			continue;
 		if (trim(readfile(`/sys/class/net/${res.ifname}/operstate`)) == "down")
 			return res.ifname;
+	}
 	return null;
 }
 
@@ -123,7 +161,6 @@ function wdev_create(phy, name, data)
 
 	nl80211.error();
 
-	let reused;
 	let reuse_ifname = find_reusable_wdev(phyidx);
 	if (reuse_ifname &&
 	    (reuse_ifname == name ||
@@ -131,7 +168,6 @@ function wdev_create(phy, name, data)
 		req.dev = req.ifname;
 		delete req.ifname;
 		nl80211.request(nl80211.const.NL80211_CMD_SET_INTERFACE, 0, req);
-		reused = true;
 	} else {
 		nl80211.request(
 			nl80211.const.NL80211_CMD_NEW_INTERFACE,
@@ -143,8 +179,11 @@ function wdev_create(phy, name, data)
 	if (error)
 		return error;
 
-	// nl80211_set_interface() ignores NL80211_ATTR_MAC
-	if (reused && data.macaddr)
+	/* nl80211_set_interface() ignores NL80211_ATTR_MAC, and a fullmac
+	 * driver may ignore NL80211_ATTR_MAC on NL80211_CMD_NEW_INTERFACE as
+	 * well: make sure the address was applied in both cases. The netdev is
+	 * still down here, which is when drivers accept a change. */
+	if (data.macaddr)
 		netdev_macaddr_set(name, data.macaddr);
 
 	if (data.powersave != null) {
